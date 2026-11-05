@@ -1122,6 +1122,9 @@ fn actions_compare_the_installed_binary_with_the_source() {
     assert!(action_matches(&InstallAction::Install, &copy, &source));
     assert!(!action_matches(&InstallAction::Install, &missing, &source));
     assert!(action_matches(&InstallAction::Reinstall, &source, &source));
+    let link = sandbox.path("dst/link");
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+    assert!(action_matches(&InstallAction::Reinstall, &link, &source));
     assert!(!action_matches(&InstallAction::Reinstall, &copy, &source));
     assert!(action_matches(&InstallAction::Update, &source, &source));
     assert!(action_matches(&InstallAction::Update, &copy, &source));

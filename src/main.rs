@@ -768,10 +768,8 @@ fn run(cli: Cli) -> Result<(), String> {
     if let Some(log) = &log {
         let names = targets.iter().map(|target| target.name()).collect::<Vec<_>>().join(",");
         let mode = if settings.parallel { "parallel" } else { "sequential" };
-        write_log(
-            log,
-            &format!("mnn started: targets={names} mode={mode} dry_run={}", cli.dry_run),
-        )?;
+        let started = format!("mnn started: targets={names} mode={mode} dry_run={}", cli.dry_run);
+        write_log(log, &started)?;
     }
     let _run_lock = acquire_run_lock()?;
     let show_progress =
