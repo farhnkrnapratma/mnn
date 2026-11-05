@@ -1,6 +1,6 @@
 ## Git workflow
 
-This repo uses **git-flow-next** (classic preset — https://git-flow.sh/). The config is committed in `.gitflow`; on a fresh clone run `git-flow init --preset=classic --defaults --main main --shared`, then `bash .githooks/install.sh` to install the git hooks (`bun install` does both the hooks and the commitlint tooling through the `prepare` script).
+This repo uses **git-flow-next** (classic preset — https://git-flow.sh/). The config is committed in `.gitflow`; on a fresh clone run `git flow config sync` to activate it (and create `develop` with `git branch develop origin/develop` if it is missing locally), then `bash .githooks/install.sh` to install the git hooks (`bun install` does the hooks and the commitlint tooling through the `prepare` script).
 
 - `main` — release only. Never commit directly; only `release/*` and `hotfix/*` branches merge into it (and get tagged).
 - `develop` — integration branch. `feature/*` and `bugfix/*` branch from and merge back into it.
