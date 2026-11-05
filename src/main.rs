@@ -390,7 +390,7 @@ struct ProgressManager {
 
 impl ProgressManager {
     fn new(show_progress: bool, silent: bool, top_offset: usize, targets: &[Target]) -> Self {
-        let size = terminal::size().unwrap_or((80, 24));
+        let size = usable_size(terminal::size().ok());
         Self::with_size(show_progress, silent, top_offset, targets, size)
     }
 
@@ -469,6 +469,10 @@ impl ProgressManager {
             finish_top_progress(&self.inner);
         }
     }
+}
+
+fn usable_size(size: Option<(u16, u16)>) -> (u16, u16) {
+    size.filter(|(width, height)| *width > 0 && *height > 0).unwrap_or((80, 24))
 }
 
 fn use_progress_footer(

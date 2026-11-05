@@ -2146,3 +2146,11 @@ fn aur_detection_needs_a_helper_next_to_pacman() {
     sandbox.bin("trizen", "exit 0");
     assert!(detect_targets_for("arch", "").contains(&Target::Aur));
 }
+
+#[test]
+fn unusable_terminal_sizes_fall_back_to_the_default() {
+    assert_eq!(usable_size(None), (80, 24));
+    assert_eq!(usable_size(Some((0, 0))), (80, 24));
+    assert_eq!(usable_size(Some((0, 10))), (80, 24));
+    assert_eq!(usable_size(Some((120, 40))), (120, 40));
+}
