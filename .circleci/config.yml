@@ -1,0 +1,122 @@
+version: 2.1
+
+executors:
+  rust:
+    docker:
+      - image: cimg/rust:1.99.1
+    resource_class: medium
+
+commands:
+  setup-bun:
+    steps:
+      - run:
+          name: Install bun
+          command: |
+            curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.4"
+            echo 'export PATH="$HOME/.bun/bin:$PATH"' >> "$BASH_ENV"
+  setup-trufflehog:
+    steps:
+      - run:
+          name: Install trufflehog
+          command: |
+            base=https://github.com/trufflesecurity/trufflehog/releases/download/v3.99.8
+            curl -fsSL -o "$HOME/trufflehog.tar.gz" "$base/trufflehog_3.99.8_linux_amd64.tar.gz"
+            curl -fsSL -o "$HOME/trufflehog.sums" "$base/trufflehog_3.99.8_checksums.txt"
+            (cd "$HOME" && grep ' trufflehog_3.99.8_linux_amd64.tar.gz$' trufflehog.sums | awk '{print $1"  trufflehog.tar.gz"}' | sha256sum -c -)
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf "$HOME/trufflehog.tar.gz" -C "$HOME/.local/bin" trufflehog
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$BASH_ENV"
+  setup-deny:
+    steps:
+      - run:
+          name: Install cargo-deny
+          command: |
+            curl -fsSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz \
+              | tar -xz --strip-components=1 -C "$HOME/.cargo/bin" --wildcards '*/cargo-deny'
+  restore-cargo:
+    parameters:
+      scope:
+        type: string
+    steps:
+      - restore_cache:
+          keys:
+            - cargo-v1-<< parameters.scope >>-{{ checksum "Cargo.lock" }}
+            - cargo-v1-<< parameters.scope >>-
+  save-cargo:
+    parameters:
+      scope:
+        type: string
+    steps:
+      - save_cache:
+          key: cargo-v1-<< parameters.scope >>-{{ checksum "Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+            - target
+
+jobs:
+  reuse:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - run: pip install --quiet reuse==6.3.0
+      - run: reuse lint
+
+  lint:
+    executor: rust
+    steps:
+      - checkout
+      - restore-cargo:
+          scope: lint
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - setup-deny
+      - run: cargo deny check
+      - save-cargo:
+          scope: lint
+
+  test:
+    executor: rust
+    steps:
+      - checkout
+      - restore-cargo:
+          scope: test
+      - run: cargo test --locked
+      - save-cargo:
+          scope: test
+
+  secrets:
+    docker:
+      - image: cimg/python:3.12
+    steps:
+      - checkout
+      - setup-trufflehog
+      - run: if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch --unshallow; fi
+      - run: trufflehog git "file://$PWD" --results=verified --fail --no-update
+
+  commitlint:
+    executor: rust
+    steps:
+      - checkout
+      - setup-bun
+      - run: bun install --frozen-lockfile
+      - run:
+          name: Lint commit messages
+          command: |
+            if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch --unshallow; fi
+            git fetch --quiet origin main:refs/remotes/origin/main
+            if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+              bunx --bun --no-install commitlint --last
+            else
+              bunx --bun --no-install commitlint --from "$(git merge-base origin/main HEAD)" --to HEAD
+            fi
+
+workflows:
+  ci:
+    jobs:
+      - reuse
+      - lint
+      - test
+      - secrets
+      - commitlint

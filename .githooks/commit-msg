@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+
+if [ ! -x "$repo_root/node_modules/.bin/commitlint" ]; then
+  echo "commitlint not installed, run 'bun install' first" >&2
+  exit 1
+fi
+
+"$repo_root/node_modules/.bin/commitlint" --edit "$1"

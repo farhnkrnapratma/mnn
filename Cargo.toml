@@ -1,0 +1,23 @@
+[package]
+name = "mnn-cli"
+version = "1.0.0-alpha1"
+authors = ["Farhan Kurnia Pratama <farhnkrnapratma@gmail.com>"]
+edition = "2024"
+description = "Easily update all your packages with a single command and keep your system up to date"
+readme = "README.md"
+homepage = "https://fkp.my.id"
+repository = "https://github.com/farhnkrnapratma/mnn"
+license = "MIT OR Apache-2.0"
+keywords = ["package-manager", "package-updater", "system-update", "cli", "automation"]
+categories = ["command-line-utilities", "development-tools"]
+include = ["/src/**/*.rs", "/resources/*", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+[[bin]]
+name = "mnn"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
+crossterm = "0.29.0"
+serde_json = "1.0.154"

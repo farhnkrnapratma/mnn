@@ -1,0 +1,90 @@
+.TH MNN 1 "2026-11-03" "mnn" "User Commands"
+.SH NAME
+mnn \- update installed package managers
+.SH SYNOPSIS
+.B mnn
+.RI [ OPTIONS ] " [TARGET...]"
+.SH DESCRIPTION
+.B mnn
+detects package managers on the host and runs their update commands from a
+regular user session. System package managers use a trusted executable path
+and refresh
+.BR sudo
+credentials before execution. Python packages are checked with
+.BR "python -m pip list --outdated"
+and upgraded individually. Logs are written to the user's state directory.
+.SH TARGETS
+.B auto
+detects installed managers;
+.B all
+selects all known targets.
+Supported targets include apt, apk, AUR helpers, brew, bun, choco, determinate,
+dnf, emerge, eopkg, flatpak, pacman, pip, pkg, pnpm, rpm-ostree, snap, soar,
+transactional-update, uv, winget, xbps, yum, and zypper.
+.SH OPTIONS
+.TP
+.BR -n ", " --dry-run
+Print planned commands without running package-manager operations.
+.TP
+.BR -s ", " --silent
+Hide package-manager output.
+.TP
+.BR -v ", " --verbose
+Print command details and package-manager output.
+.TP
+.B --parallel
+Run user-level targets concurrently while serializing system targets.
+.TP
+.B --install-completions [MODE]
+Install bash, fish, zsh, or Nushell completions. MODE may be a shell name,
+.BR all ,
+or
+.BR detect .
+.TP
+.BR -i ", " --install
+Install the current executable, manual page, completions, and default config.
+.TP
+.BR -r ", " --reinstall
+Replace the installed executable and selected completions.
+.TP
+.BR -u ", " --update
+Update the installed executable and selected completions when changed.
+.TP
+.BR -x ", " --uninstall
+Remove the executable, manual page, and completions.
+.TP
+.BR -p ", " --purge
+Also remove the config and log files.
+.TP
+.BR -c ", " --gen-config
+Create the default config file.
+.SH CONFIGURATION
+The config file is
+.IR ~/.config/mnn/config .
+It accepts
+.BR targets ,
+.BR verbose ,
+.BR silent ,
+.BR parallel ,
+and
+.BR disable-log
+settings in
+.IR key=value
+form.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Base directory for configuration and Nushell completion.
+.TP
+.B XDG_DATA_HOME
+Base directory for manual page and bash, fish, and zsh completion.
+.TP
+.B XDG_STATE_HOME
+Base directory for logs and the run lock.
+.TP
+.B MNN_SOURCE_DIR
+Optional directory containing the binary to install or update.
+.SH SEE ALSO
+.BR pip (1),
+.BR winget (1),
+.BR choco (1)

@@ -1,0 +1,12 @@
+{
+  "name": "mnn-tooling",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "scripts": {
+    "prepare": "bash .githooks/install.sh"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.4",
+    "@commitlint/config-conventional": "^21.2.4"
+  }
+}
