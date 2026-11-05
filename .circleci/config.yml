@@ -13,6 +13,7 @@ commands:
           name: Install bun
           command: |
             curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.4"
+            ln -sf "$HOME/.bun/bin/bun" "$HOME/.bun/bin/bunx"
             echo 'export PATH="$HOME/.bun/bin:$PATH"' >> "$BASH_ENV"
   setup-trufflehog:
     steps:
