@@ -11,7 +11,9 @@ This repo uses **git-flow-next** (classic preset — https://git-flow.sh/). The 
 
 Commit messages must follow [Conventional Commits](https://www.conventionalcommits.org), enforced by commitlint (`commitlint.config.js`) in the `commit-msg` hook and in CI; validate a candidate message with `printf '%s' "<message>" | bunx commitlint`.
 
-CI runs on CircleCI (`.circleci/config.yml`): `reuse lint`, format/lint, tests, `cargo deny`, secret scan (trufflehog) and commitlint on every push.
+CI runs on CircleCI (`.circleci/config.yml`): `reuse lint`, format/lint, tests, coverage (`cargo llvm-cov --locked --summary-only` must report zero uncovered lines and functions), `cargo deny`, secret scan (trufflehog) and commitlint on every push.
+
+Tests live in `src/tests/` (compiled only under `cfg(test)`) and run in one binary, because `cargo llvm-cov` counts a line as covered only when a single binary executes it. They serialise on a sandbox that rewrites `HOME`, `PATH` and the trusted-directory list, so they never touch the real system; console output goes through `emit` and is captured under test. `main` is excluded from test builds, so keep it a thin wrapper around `run`. Avoid generic functions and `if` statements without an `else` that one branch never reaches, since llvm-cov scores each instantiation and each closing brace on its own. Write no comments in code.
 
 ## graphify
 

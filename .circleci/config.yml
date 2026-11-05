@@ -87,6 +87,22 @@ jobs:
       - save-cargo:
           scope: test
 
+  coverage:
+    executor: rust
+    steps:
+      - checkout
+      - restore-cargo:
+          scope: coverage
+      - run:
+          name: Install cargo-llvm-cov
+          command: |
+            rustup component add llvm-tools-preview
+            curl -fsSL https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz \
+              | tar -xz -C "$HOME/.cargo/bin"
+      - run: cargo llvm-cov --locked --summary-only --fail-under-lines 99.999 --fail-under-functions 99.999
+      - save-cargo:
+          scope: coverage
+
   secrets:
     docker:
       - image: cimg/python:3.12
@@ -122,5 +138,6 @@ workflows:
       - reuse
       - lint
       - test
+      - coverage
       - secrets
       - commitlint

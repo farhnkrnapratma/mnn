@@ -4,12 +4,13 @@ use crossterm::terminal;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -242,10 +243,8 @@ impl Step {
     }
 
     fn with_env(mut self, env: &[(&str, &str)]) -> Self {
-        self.env = env
-            .iter()
-            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
-            .collect();
+        self.env =
+            env.iter().map(|(key, value)| (OsString::from(key), OsString::from(value))).collect();
         self
     }
 }
@@ -290,20 +289,16 @@ impl SudoKeepalive {
                     .status();
             }
         });
-        Self {
-            stop,
-            thread: Some(thread),
-        }
+        Self { stop, thread: Some(thread) }
     }
 }
 
 impl Drop for SudoKeepalive {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            thread.thread().unpark();
-            let _ = thread.join();
-        }
+        let thread = self.thread.take().expect("the keepalive thread is joined once");
+        thread.thread().unpark();
+        let _ = thread.join();
     }
 }
 
@@ -332,19 +327,80 @@ struct ProgressRow {
     running: bool,
 }
 
+fn describe<E: Display>(context: impl Display) -> impl FnOnce(E) -> String {
+    move |error| format!("{context}: {error}")
+}
+
+fn missing(message: &'static str) -> impl FnOnce() -> String {
+    move || message.to_owned()
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+static CAPTURE: Mutex<Option<Capture>> = Mutex::new(None);
+
+#[derive(Default)]
+struct Capture {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    fail: bool,
+}
+
+struct Console;
+
+impl Write for Console {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        emit(false, bytes).map(|()| bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn emit(is_stderr: bool, bytes: &[u8]) -> io::Result<()> {
+    if let Some(capture) = lock(&CAPTURE).as_mut() {
+        if capture.fail {
+            return Err(io::Error::other("console unavailable"));
+        }
+        let sink = if is_stderr { &mut capture.stderr } else { &mut capture.stdout };
+        sink.extend_from_slice(bytes);
+        return Ok(());
+    }
+    if is_stderr {
+        let mut stream = io::stderr().lock();
+        stream.write_all(bytes)?;
+        stream.flush()
+    } else {
+        let mut stream = io::stdout().lock();
+        stream.write_all(bytes)?;
+        stream.flush()
+    }
+}
+
 const PROGRESS_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 struct ProgressManager {
     inner: Arc<ProgressInner>,
     ticker: Option<JoinHandle<()>>,
     footer_active: bool,
-    print_completed_rows: bool,
 }
 
 impl ProgressManager {
     fn new(show_progress: bool, silent: bool, top_offset: usize, targets: &[Target]) -> Self {
-        let terminal_size = terminal::size().ok();
-        let (width, height) = terminal_size.unwrap_or((80, 24));
+        let size = terminal::size().unwrap_or((80, 24));
+        Self::with_size(show_progress, silent, top_offset, targets, size)
+    }
+
+    fn with_size(
+        show_progress: bool,
+        silent: bool,
+        top_offset: usize,
+        targets: &[Target],
+        (width, height): (u16, u16),
+    ) -> Self {
         let footer = use_progress_footer(show_progress, height as usize, targets.len(), top_offset);
         let visible = footer || (show_progress && silent);
         let inner = Arc::new(ProgressInner {
@@ -380,10 +436,7 @@ impl ProgressManager {
                     if thread_inner.stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let mut rows = thread_inner
-                        .rows
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
+                    let mut rows = lock(&thread_inner.rows);
                     let mut changed = false;
                     for row in rows.iter_mut().filter(|row| row.running) {
                         row.symbol = PROGRESS_FRAMES[frame % PROGRESS_FRAMES.len()];
@@ -396,19 +449,11 @@ impl ProgressManager {
                 }
             })
         });
-        Self {
-            inner,
-            ticker,
-            footer_active: footer,
-            print_completed_rows: !silent,
-        }
+        Self { inner, ticker, footer_active: footer }
     }
 
     fn bar(&self, index: usize) -> ProgressBar {
-        ProgressBar {
-            inner: Arc::clone(&self.inner),
-            index,
-        }
+        ProgressBar { inner: Arc::clone(&self.inner), index }
     }
 
     fn finish(&mut self) {
@@ -418,7 +463,7 @@ impl ProgressManager {
             let _ = thread.join();
         }
         if self.footer_active {
-            teardown_footer(&self.inner, self.print_completed_rows);
+            teardown_footer(&self.inner);
             self.footer_active = false;
         } else if self.inner.top && self.inner.visible {
             finish_top_progress(&self.inner);
@@ -442,14 +487,10 @@ impl Drop for ProgressManager {
 }
 
 impl ProgressBar {
-    fn set_message(&self, message: impl Into<String>) {
-        let mut rows = self
-            .inner
-            .rows
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+    fn set_message(&self, message: &str) {
+        let mut rows = lock(&self.inner.rows);
         if let Some(row) = rows.get_mut(self.index) {
-            row.message = message.into();
+            row.message = message.to_owned();
             row.symbol = PROGRESS_FRAMES[0];
             row.status = "UPDATING";
             row.running = true;
@@ -458,11 +499,7 @@ impl ProgressBar {
     }
 
     fn finish(&self, target: Target, status: &Status) {
-        let mut rows = self
-            .inner
-            .rows
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut rows = lock(&self.inner.rows);
         if let Some(row) = rows.get_mut(self.index) {
             match status {
                 Status::Ok => {
@@ -488,11 +525,6 @@ impl ProgressBar {
             }
             row.running = false;
             draw_footer(&self.inner, &rows);
-            if self.inner.visible && !self.inner.footer && !self.inner.top {
-                let mut stream = io::stdout().lock();
-                let _ = writeln!(stream);
-                let _ = stream.flush();
-            }
         }
     }
 
@@ -501,99 +533,69 @@ impl ProgressBar {
     }
 
     fn println(&self, line: &str) {
-        let rows = self
-            .inner
-            .rows
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let mut stream = io::stdout().lock();
-        let _ = writeln!(stream, "{line}");
-        let _ = stream.flush();
+        let rows = lock(&self.inner.rows);
+        let _ = emit(false, format!("{line}\n").as_bytes());
         draw_footer(&self.inner, &rows);
     }
 
     fn write_output(&self, bytes: &[u8], is_stderr: bool) -> io::Result<()> {
-        let _rows = self
-            .inner
-            .rows
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if is_stderr {
-            let mut stream = io::stderr().lock();
-            stream.write_all(bytes)?;
-            stream.flush()
-        } else {
-            let mut stream = io::stdout().lock();
-            stream.write_all(bytes)?;
-            stream.flush()
-        }
+        let _rows = lock(&self.inner.rows);
+        emit(is_stderr, bytes)
     }
 }
 
 fn initialize_footer(inner: &ProgressInner) {
-    let count = inner
-        .rows
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .len();
+    let count = lock(&inner.rows).len();
     let top = inner.height.saturating_sub(count);
-    let mut stream = io::stdout().lock();
-    if inner.top {
+    let setup = if inner.top {
         let first_output_row = count + inner.top_offset + 1;
-        let _ = write!(
-            stream,
-            "\x1b[{first_output_row};{}r\x1b[{first_output_row};1H\x1b[?25l",
-            inner.height
-        );
+        format!("\x1b[{first_output_row};{}r\x1b[{first_output_row};1H\x1b[?25l", inner.height)
     } else {
-        let _ = stream.write_all("\n".repeat(count).as_bytes());
-        let _ = write!(stream, "\x1b[{count}A\x1b7\x1b[1;{top}r\x1b8\x1b[?25l");
-    }
-    let _ = stream.flush();
-    let rows = inner.rows.lock().unwrap_or_else(|error| error.into_inner());
+        format!("{}\x1b[{count}A\x1b7\x1b[1;{top}r\x1b8\x1b[?25l", "\n".repeat(count))
+    };
+    let _ = emit(false, setup.as_bytes());
+    let rows = lock(&inner.rows);
     draw_footer(inner, &rows);
 }
 
+fn current_row(rows: &[ProgressRow]) -> Option<(usize, &ProgressRow)> {
+    rows.iter()
+        .enumerate()
+        .rev()
+        .find(|(_, row)| row.running)
+        .or_else(|| rows.iter().enumerate().next_back())
+}
+
 fn draw_footer(inner: &ProgressInner, rows: &[ProgressRow]) {
-    if inner.footer {
-        let mut stream = io::stdout().lock();
-        for (index, row) in rows.iter().enumerate() {
-            let line = format_progress_line(index + 1, rows.len(), row, inner.width, inner.colored);
-            let terminal_row =
-                progress_terminal_row(index, rows.len(), inner.height, inner.top, inner.top_offset);
-            let _ = write!(stream, "\x1b7\x1b[{terminal_row};1H\x1b[2K{line}\x1b8");
-        }
-        let _ = stream.flush();
-        return;
-    }
-    if inner.top
-        && inner.visible
-        && let Some((index, row)) = rows
-            .iter()
+    let frame = if inner.footer {
+        rows.iter()
             .enumerate()
-            .rev()
-            .find(|(_, row)| row.running)
-            .or_else(|| rows.iter().enumerate().next_back())
-    {
-        let line = format_progress_line(index + 1, rows.len(), row, inner.width, inner.colored);
-        let mut stream = io::stdout().lock();
-        let row = inner.top_offset + 1;
-        let _ = write!(stream, "\x1b7\x1b[{row};1H\x1b[2K{line}\x1b8");
-        let _ = stream.flush();
-        return;
-    }
-    if inner.visible
-        && let Some((index, row)) = rows
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, row)| row.running)
-            .or_else(|| rows.iter().enumerate().next_back())
-    {
-        let line = format_progress_line(index + 1, rows.len(), row, inner.width, inner.colored);
-        let mut stream = io::stdout().lock();
-        let _ = write!(stream, "\r\x1b[2K{line}");
-        let _ = stream.flush();
+            .map(|(index, row)| {
+                let line =
+                    format_progress_line(index + 1, rows.len(), row, inner.width, inner.colored);
+                let terminal_row = progress_terminal_row(
+                    index,
+                    rows.len(),
+                    inner.height,
+                    inner.top,
+                    inner.top_offset,
+                );
+                format!("\x1b7\x1b[{terminal_row};1H\x1b[2K{line}\x1b8")
+            })
+            .collect::<String>()
+    } else if inner.visible {
+        current_row(rows)
+            .map(|(index, row)| {
+                let line =
+                    format_progress_line(index + 1, rows.len(), row, inner.width, inner.colored);
+                format!("\x1b7\x1b[{};1H\x1b[2K{line}\x1b8", inner.top_offset + 1)
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if !frame.is_empty() {
+        let _ = emit(false, frame.as_bytes());
     }
 }
 
@@ -604,11 +606,7 @@ fn progress_terminal_row(
     at_top: bool,
     top_offset: usize,
 ) -> usize {
-    if at_top {
-        top_offset + index + 1
-    } else {
-        height.saturating_sub(count) + index + 1
-    }
+    if at_top { top_offset + index + 1 } else { height.saturating_sub(count) + index + 1 }
 }
 
 fn format_progress_line(
@@ -623,9 +621,7 @@ fn format_progress_line(
     let status = row.status;
     let available = width.saturating_sub(left_width + status.len() + 2);
     let message: String = row.message.chars().take(available).collect();
-    let padding = width
-        .saturating_sub(left_width + message.chars().count() + status.len())
-        .max(1);
+    let padding = width.saturating_sub(left_width + message.chars().count() + status.len()).max(1);
     let color = match row.status {
         "UPDATING" => "33",
         "OK" => "32",
@@ -645,46 +641,44 @@ fn format_progress_line(
     }
 }
 
-fn teardown_footer(inner: &ProgressInner, print_completed_rows: bool) {
-    let rows = inner.rows.lock().unwrap_or_else(|error| error.into_inner());
-    if inner.top {
-        let next_row = top_progress_next_row(rows.len(), inner.top_offset, true);
-        let mut stream = io::stdout().lock();
-        let _ = write!(stream, "\x1b[r\x1b[{next_row};1H\x1b[?25h");
-        let _ = stream.flush();
-        return;
-    }
-    let mut stream = io::stdout().lock();
-    let _ = stream.write_all(b"\x1b[r\x1b7");
-    for index in 0..rows.len() {
-        let terminal_row =
-            progress_terminal_row(index, rows.len(), inner.height, false, inner.top_offset);
-        let _ = write!(stream, "\x1b[{terminal_row};1H\x1b[2K");
-    }
-    let _ = stream.write_all(b"\x1b8\x1b[?25h\r\n");
-    if print_completed_rows {
-        for (index, row) in rows.iter().enumerate() {
-            let line = format_progress_line(index + 1, rows.len(), row, inner.width, inner.colored);
-            let _ = writeln!(stream, "{line}");
+fn teardown_footer(inner: &ProgressInner) {
+    let rows = lock(&inner.rows);
+    let text = if inner.top {
+        format!(
+            "\x1b[r\x1b[{};1H\x1b[?25h",
+            top_progress_next_row(rows.len(), inner.top_offset, true)
+        )
+    } else {
+        let mut text = String::from("\x1b[r\x1b7");
+        for index in 0..rows.len() {
+            let terminal_row =
+                progress_terminal_row(index, rows.len(), inner.height, false, inner.top_offset);
+            text.push_str(&format!("\x1b[{terminal_row};1H\x1b[2K"));
         }
-    }
-    let _ = stream.flush();
+        text.push_str("\x1b8\x1b[?25h\r\n");
+        for (index, row) in rows.iter().enumerate() {
+            text.push_str(&format_progress_line(
+                index + 1,
+                rows.len(),
+                row,
+                inner.width,
+                inner.colored,
+            ));
+            text.push('\n');
+        }
+        text
+    };
+    let _ = emit(false, text.as_bytes());
 }
 
 fn finish_top_progress(inner: &ProgressInner) {
-    let rows = inner.rows.lock().unwrap_or_else(|error| error.into_inner());
+    let rows = lock(&inner.rows);
     let next_row = top_progress_next_row(rows.len(), inner.top_offset, inner.footer);
-    let mut stream = io::stdout().lock();
-    let _ = write!(stream, "\x1b[{next_row};1H\x1b[?25h");
-    let _ = stream.flush();
+    let _ = emit(false, format!("\x1b[{next_row};1H\x1b[?25h").as_bytes());
 }
 
 fn top_progress_next_row(count: usize, top_offset: usize, footer: bool) -> usize {
-    if footer {
-        count + top_offset + 1
-    } else {
-        top_offset + 2
-    }
+    if footer { count + top_offset + 1 } else { top_offset + 2 }
 }
 
 fn write_top_notice(stream: &mut impl Write, notice: &str) -> io::Result<()> {
@@ -692,31 +686,25 @@ fn write_top_notice(stream: &mut impl Write, notice: &str) -> io::Result<()> {
     stream.flush()
 }
 
+#[cfg(not(test))]
 fn main() {
-    if let Err(error) = run() {
+    if let Err(error) = run(Cli::parse()) {
         eprintln!("mnn: {error}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), String> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<(), String> {
     if let Some(mode) = cli.print_completion {
         print_completion(mode);
         return Ok(());
     }
 
-    let action_count = [
-        cli.install,
-        cli.reinstall,
-        cli.update,
-        cli.uninstall,
-        cli.purge,
-        cli.gen_config,
-    ]
-    .into_iter()
-    .filter(|value| *value)
-    .count();
+    let action_count =
+        [cli.install, cli.reinstall, cli.update, cli.uninstall, cli.purge, cli.gen_config]
+            .into_iter()
+            .filter(|value| *value)
+            .count();
 
     let mut settings = load_settings()?;
     if !cli.targets.is_empty() {
@@ -744,21 +732,18 @@ fn run() -> Result<(), String> {
             generate_config()?;
             return Ok(());
         }
-        if cli.install {
-            return maintain(InstallAction::Install, cli.install_completions);
-        }
-        if cli.reinstall {
-            return maintain(InstallAction::Reinstall, cli.install_completions);
-        }
-        if cli.update {
-            return maintain(InstallAction::Update, cli.install_completions);
-        }
-        if cli.uninstall {
-            return maintain(InstallAction::Uninstall, cli.install_completions);
-        }
-        if cli.purge {
-            return maintain(InstallAction::Purge, cli.install_completions);
-        }
+        let action = if cli.install {
+            InstallAction::Install
+        } else if cli.reinstall {
+            InstallAction::Reinstall
+        } else if cli.update {
+            InstallAction::Update
+        } else if cli.uninstall {
+            InstallAction::Uninstall
+        } else {
+            InstallAction::Purge
+        };
+        return maintain(action, cli.install_completions);
     }
     if let Some(mode) = cli.install_completions {
         if !cli.targets.is_empty() {
@@ -769,9 +754,7 @@ fn run() -> Result<(), String> {
     }
 
     #[cfg(unix)]
-    if effective_uid() == 0 {
-        return Err("do not run as root; run as a regular user".to_owned());
-    }
+    ensure_not_root(effective_uid())?;
 
     if settings.silent && settings.verbose {
         return Err("--silent and --verbose cannot be used together".to_owned());
@@ -780,35 +763,19 @@ fn run() -> Result<(), String> {
     if targets.is_empty() {
         return Err("no supported package managers detected".to_owned());
     }
-    let log = if settings.disable_log {
-        None
-    } else {
-        Some(Arc::new(Mutex::new(open_log_file()?)))
-    };
+    let log =
+        if settings.disable_log { None } else { Some(Arc::new(Mutex::new(open_log_file()?))) };
     if let Some(log) = &log {
-        append_log(
+        let names = targets.iter().map(|target| target.name()).collect::<Vec<_>>().join(",");
+        let mode = if settings.parallel { "parallel" } else { "sequential" };
+        write_log(
             log,
-            &format!(
-                "mnn started: targets={} mode={} dry_run={}",
-                targets
-                    .iter()
-                    .map(|target| target.name())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                if settings.parallel {
-                    "parallel"
-                } else {
-                    "sequential"
-                },
-                cli.dry_run
-            ),
-        )
-        .map_err(|error| format!("could not write log: {error}"))?;
+            &format!("mnn started: targets={names} mode={mode} dry_run={}", cli.dry_run),
+        )?;
     }
     let _run_lock = acquire_run_lock()?;
-    let show_progress = !cli.dry_run
-        && io::stdout().is_terminal()
-        && std::env::var("TERM").is_ok_and(|term| term != "dumb");
+    let show_progress =
+        progress_wanted(cli.dry_run, io::stdout().is_terminal(), std::env::var_os("TERM"));
     let reserve_sudo_line =
         show_progress && settings.silent && !cli.dry_run && targets_need_sudo(&targets, &settings);
     let _sudo_keepalive =
@@ -818,102 +785,73 @@ fn run() -> Result<(), String> {
     }
     let top_offset = usize::from(reserve_sudo_line);
     let mut progress = ProgressManager::new(show_progress, settings.silent, top_offset, &targets);
-    let progress_bars: Vec<_> = (0..targets.len())
-        .map(|index| progress.bar(index))
-        .collect();
+    let progress_bars: Vec<_> = (0..targets.len()).map(|index| progress.bar(index)).collect();
     let system_lane = Arc::new(Mutex::new(()));
-    let results = execute_targets(&targets, settings.parallel, |index, target| {
-        run_target(
-            target,
-            &settings,
-            cli.dry_run,
-            &system_lane,
-            log.clone(),
-            &progress_bars[index],
-        )
+    let results = execute_targets(&targets, settings.parallel, &|index, target| {
+        run_target(target, &settings, cli.dry_run, &system_lane, log.clone(), &progress_bars[index])
     });
 
     progress.finish();
-    let mut succeeded = 0;
-    let mut unavailable = 0;
-    let mut skipped = 0;
-    let mut failed = 0;
-    for result in results {
-        if !settings.silent {
-            for line in &result.output {
-                if !line.is_empty() {
-                    println!("{line}");
-                }
-            }
-        }
-        if let Some(log) = &log {
-            append_log(
-                log,
-                &format!(
-                    "target {}: {}",
-                    result.target.name(),
-                    match &result.status {
-                        Status::Ok => "OK".to_owned(),
-                        Status::Unavailable(reason) => format!("UNAVAILABLE ({reason})"),
-                        Status::Skipped(reason) => format!("SKIP ({reason})"),
-                        Status::Failed(reason) => format!("ERR ({reason})"),
-                    }
-                ),
-            )
-            .map_err(|error| format!("could not write log: {error}"))?;
-        }
-        match result.status {
-            Status::Ok => {
-                succeeded += 1;
-                if !show_progress {
-                    println!("✓ {}: OK", result.target.name());
-                }
-            }
-            Status::Unavailable(reason) => {
-                unavailable += 1;
-                if !show_progress {
-                    println!("○ {}: {reason}", result.target.name());
-                }
-            }
-            Status::Skipped(reason) => {
-                skipped += 1;
-                if !show_progress {
-                    println!("⊘ {}: {reason}", result.target.name());
-                }
-            }
-            Status::Failed(reason) => {
-                failed += 1;
-                if !show_progress {
-                    eprintln!("✗ {}: {reason}", result.target.name());
-                }
-            }
-        }
-    }
-
+    let [succeeded, unavailable, skipped, failed] =
+        report(results, settings.silent, show_progress, log.as_ref())?;
     println!(
         "{succeeded} succeeded, {unavailable} unavailable, {skipped} skipped, {failed} failed"
     );
-    if failed > 0 {
-        Err("one or more package-manager targets failed".to_owned())
-    } else {
-        Ok(())
-    }
+    if failed > 0 { Err("one or more package-manager targets failed".to_owned()) } else { Ok(()) }
 }
 
-fn execute_targets<F>(targets: &[Target], parallel: bool, execute: F) -> Vec<TargetResult>
-where
-    F: Fn(usize, Target) -> TargetResult + Sync,
-{
+fn report(
+    results: Vec<TargetResult>,
+    silent: bool,
+    show_progress: bool,
+    log: Option<&Arc<Mutex<File>>>,
+) -> Result<[usize; 4], String> {
+    let mut counts = [0; 4];
+    for result in results {
+        for line in result.output.iter().filter(|line| !silent && !line.is_empty()) {
+            println!("{line}");
+        }
+        let name = result.target.name();
+        let (slot, symbol, detail, label) = match result.status {
+            Status::Ok => (0, '✓', "OK".to_owned(), "OK".to_owned()),
+            Status::Unavailable(reason) => {
+                (1, '○', reason.clone(), format!("UNAVAILABLE ({reason})"))
+            }
+            Status::Skipped(reason) => (2, '⊘', reason.clone(), format!("SKIP ({reason})")),
+            Status::Failed(reason) => (3, '✗', reason.clone(), format!("ERR ({reason})")),
+        };
+        if let Some(log) = log {
+            write_log(log, &format!("target {name}: {label}"))?;
+        }
+        counts[slot] += 1;
+        if !show_progress {
+            let line = format!("{symbol} {name}: {detail}");
+            if slot == 3 {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn progress_wanted(dry_run: bool, terminal: bool, term: Option<OsString>) -> bool {
+    !dry_run && terminal && term.is_some_and(|term| term != "dumb")
+}
+
+fn execute_targets(
+    targets: &[Target],
+    parallel: bool,
+    execute: &(dyn Fn(usize, Target) -> TargetResult + Sync),
+) -> Vec<TargetResult> {
     if parallel && targets.len() > 1 {
         std::thread::scope(|scope| {
             let handles: Vec<_> = targets
                 .iter()
                 .copied()
                 .enumerate()
-                .map(|(index, target)| {
-                    let execute = &execute;
-                    (target, scope.spawn(move || execute(index, target)))
-                })
+                .map(|(index, target)| (target, scope.spawn(move || execute(index, target))))
                 .collect();
             handles
                 .into_iter()
@@ -927,13 +865,13 @@ where
                 .collect()
         })
     } else {
-        targets
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, target)| execute(index, target))
-            .collect()
+        targets.iter().copied().enumerate().map(|(index, target)| execute(index, target)).collect()
     }
+}
+
+#[cfg(unix)]
+fn ensure_not_root(uid: u32) -> Result<(), String> {
+    if uid == 0 { Err("do not run as root; run as a regular user".to_owned()) } else { Ok(()) }
 }
 
 #[cfg(unix)]
@@ -1023,11 +961,11 @@ fn expand_targets(requested: &[Target]) -> Vec<Target> {
 
 fn detect_targets() -> Vec<Target> {
     let (os_id, os_like) = read_os_release();
-    let is = |names: &[&str]| {
-        names
-            .iter()
-            .any(|name| os_id == *name || os_like.contains(name))
-    };
+    detect_targets_for(&os_id, &os_like)
+}
+
+fn detect_targets_for(os_id: &str, os_like: &str) -> Vec<Target> {
+    let is = |names: &[&str]| names.iter().any(|name| os_id == *name || os_like.contains(name));
     let has = |command: &str| find_program(OsStr::new(command)).is_some();
     let mut targets = Vec::new();
     if has("apt") {
@@ -1059,10 +997,7 @@ fn detect_targets() -> Vec<Target> {
     }
     if has("pacman") && (is(&["arch", "manjaro"]) || os_id.is_empty()) {
         targets.push(Target::Pacman);
-        if ["yay", "paru", "pikaur", "trizen"]
-            .iter()
-            .any(|cmd| has(cmd))
-        {
+        if ["yay", "paru", "pikaur", "trizen"].iter().any(|cmd| has(cmd)) {
             targets.push(Target::Aur);
         }
     }
@@ -1118,19 +1053,17 @@ fn detect_targets() -> Vec<Target> {
 }
 
 fn pip_available() -> bool {
-    pip_interpreter_with(find_program, pip_installation_available).is_some()
+    pip_interpreter_with(&find_program, &pip_installation_available).is_some()
 }
 
 fn pip_interpreter_with(
-    mut find: impl FnMut(&OsStr) -> Option<PathBuf>,
-    mut is_installed: impl FnMut(&str, &Path) -> bool,
+    find: &dyn Fn(&OsStr) -> Option<PathBuf>,
+    is_installed: &dyn Fn(&str, &Path) -> bool,
 ) -> Option<(String, PathBuf)> {
-    ["pip", "pip3", "python", "python3", "py"]
-        .iter()
-        .find_map(|candidate| {
-            let executable = find(OsStr::new(candidate))?;
-            is_installed(candidate, &executable).then(|| ((*candidate).to_owned(), executable))
-        })
+    ["pip", "pip3", "python", "python3", "py"].iter().find_map(|candidate| {
+        let executable = find(OsStr::new(candidate))?;
+        is_installed(candidate, &executable).then(|| ((*candidate).to_owned(), executable))
+    })
 }
 
 fn pip_installation_available(program: &str, executable: &Path) -> bool {
@@ -1155,9 +1088,10 @@ fn pip_installation_available(program: &str, executable: &Path) -> bool {
 }
 
 fn read_os_release() -> (String, String) {
-    let Ok(data) = fs::read_to_string("/etc/os-release") else {
-        return (String::new(), String::new());
-    };
+    parse_os_release(&fs::read_to_string("/etc/os-release").unwrap_or_default())
+}
+
+fn parse_os_release(data: &str) -> (String, String) {
     let mut id = String::new();
     let mut like = String::new();
     for line in data.lines() {
@@ -1192,12 +1126,8 @@ fn run_target(
     log: SharedLog,
     progress: &ProgressBar,
 ) -> TargetResult {
-    let mut result = TargetResult {
-        target,
-        status: Status::Ok,
-        output: Vec::new(),
-    };
-    progress.set_message(format!("Updating {}...", target.name()));
+    let mut result = TargetResult { target, status: Status::Ok, output: Vec::new() };
+    progress.set_message(&format!("Updating {}...", target.name()));
     if target == Target::Bun && !script_installed("bun", "BUN_INSTALL", ".bun") {
         result.status =
             Status::Unavailable("bun was not installed by its install script".to_owned());
@@ -1217,36 +1147,18 @@ fn run_target(
     }
     let serial_system_lane = target.needs_sudo() || target == Target::Aur;
     if serial_system_lane {
-        let _lane = system_lane.lock().unwrap_or_else(|e| e.into_inner());
+        let _lane = lock(system_lane);
         let steps = target_steps(target, settings.verbose);
-        if target.needs_sudo()
-            && steps
-                .iter()
-                .any(|step| !trusted_program_exists(&step.program))
-        {
+        if target.needs_sudo() && steps.iter().any(|step| !trusted_program_exists(&step.program)) {
             result.status = Status::Unavailable(
                 "required command is not a trusted system executable".to_owned(),
             );
             finish_target_progress(progress, target, &result.status);
             return result;
         }
-        run_target_inner(
-            target,
-            settings,
-            dry_run,
-            &mut result,
-            log.as_ref(),
-            progress,
-        );
+        run_target_inner(target, settings, dry_run, &mut result, log.as_ref(), progress);
     } else {
-        run_target_inner(
-            target,
-            settings,
-            dry_run,
-            &mut result,
-            log.as_ref(),
-            progress,
-        );
+        run_target_inner(target, settings, dry_run, &mut result, log.as_ref(), progress);
     }
     finish_target_progress(progress, target, &result.status);
     result
@@ -1284,12 +1196,10 @@ fn run_target_inner(
         return;
     }
     for step in steps {
-        progress.set_message(step.description.trim_end_matches('.').to_owned());
+        progress.set_message(step.description.trim_end_matches('.'));
         if step.system && target.needs_sudo() && !trusted_program_exists(&step.program) {
-            result.status = Status::Unavailable(format!(
-                "{} is not a trusted system executable",
-                step.program
-            ));
+            result.status =
+                Status::Unavailable(format!("{} is not a trusted system executable", step.program));
             return;
         }
         if !step.system && find_program(OsStr::new(&step.program)).is_none() {
@@ -1351,10 +1261,7 @@ fn target_steps(target: Target, verbose: bool) -> Vec<Step> {
                     &["-y", "autoremove", "--purge"],
                     sys,
                 )
-                .with_env(&[
-                    ("DEBIAN_FRONTEND", "noninteractive"),
-                    ("NEEDRESTART_MODE", "a"),
-                ]),
+                .with_env(&[("DEBIAN_FRONTEND", "noninteractive"), ("NEEDRESTART_MODE", "a")]),
             ]
         }
         Target::Aur => {
@@ -1407,26 +1314,11 @@ fn target_steps(target: Target, verbose: bool) -> Vec<Step> {
             sys,
         )],
         Target::Dnf => vec![
-            Step::new(
-                "Upgrading dnf packages...",
-                "dnf",
-                &["-y", "upgrade", "--refresh"],
-                sys,
-            ),
-            Step::new(
-                "Removing obsolete dnf packages...",
-                "dnf",
-                &["-y", "autoremove"],
-                sys,
-            ),
+            Step::new("Upgrading dnf packages...", "dnf", &["-y", "upgrade", "--refresh"], sys),
+            Step::new("Removing obsolete dnf packages...", "dnf", &["-y", "autoremove"], sys),
         ],
         Target::Emerge => vec![
-            Step::new(
-                "Synchronizing emerge repositories...",
-                "emerge",
-                &["--sync"],
-                sys,
-            ),
+            Step::new("Synchronizing emerge repositories...", "emerge", &["--sync"], sys),
             Step::new(
                 "Updating emerge world set...",
                 "emerge",
@@ -1434,24 +1326,18 @@ fn target_steps(target: Target, verbose: bool) -> Vec<Step> {
                 sys,
             ),
         ],
-        Target::Eopkg => vec![Step::new(
-            "Upgrading eopkg packages...",
-            "eopkg",
-            &["-y", "upgrade"],
-            sys,
-        )],
+        Target::Eopkg => {
+            vec![Step::new("Upgrading eopkg packages...", "eopkg", &["-y", "upgrade"], sys)]
+        }
         Target::Flatpak => vec![Step::new(
             "Updating flatpak packages...",
             "flatpak",
             &["update", "--assumeyes", "--noninteractive"],
             false,
         )],
-        Target::Pacman => vec![Step::new(
-            "Upgrading pacman packages...",
-            "pacman",
-            &["-Syu", "--noconfirm"],
-            sys,
-        )],
+        Target::Pacman => {
+            vec![Step::new("Upgrading pacman packages...", "pacman", &["-Syu", "--noconfirm"], sys)]
+        }
         Target::Pkg if is_termux() => vec![
             Step::new("Updating pkg repositories...", "pkg", &["update"], false),
             Step::new(
@@ -1481,33 +1367,15 @@ fn target_steps(target: Target, verbose: bool) -> Vec<Step> {
                 .with_env(&[("ASSUME_ALWAYS_YES", "yes")]),
             Step::new("Upgrading pkg packages...", "pkg", &["upgrade", "-y"], sys)
                 .with_env(&[("ASSUME_ALWAYS_YES", "yes")]),
-            Step::new(
-                "Removing orphaned pkg packages...",
-                "pkg",
-                &["autoremove", "-y"],
-                sys,
-            )
-            .with_env(&[("ASSUME_ALWAYS_YES", "yes")]),
+            Step::new("Removing orphaned pkg packages...", "pkg", &["autoremove", "-y"], sys)
+                .with_env(&[("ASSUME_ALWAYS_YES", "yes")]),
         ],
         Target::Pip => Vec::new(),
-        Target::Pnpm => vec![Step::new(
-            "Upgrading pnpm...",
-            "pnpm",
-            &["self-update"],
-            false,
-        )],
-        Target::RpmOstree => vec![Step::new(
-            "Upgrading rpm-ostree deployment...",
-            "rpm-ostree",
-            &["upgrade"],
-            sys,
-        )],
-        Target::Snap => vec![Step::new(
-            "Refreshing snap packages...",
-            "snap",
-            &["refresh"],
-            sys,
-        )],
+        Target::Pnpm => vec![Step::new("Upgrading pnpm...", "pnpm", &["self-update"], false)],
+        Target::RpmOstree => {
+            vec![Step::new("Upgrading rpm-ostree deployment...", "rpm-ostree", &["upgrade"], sys)]
+        }
+        Target::Snap => vec![Step::new("Refreshing snap packages...", "snap", &["refresh"], sys)],
         Target::Soar => vec![
             Step::new("Syncing soar index...", "soar", &["sync"], false),
             Step::new("Updating soar packages...", "soar", &["update"], false),
@@ -1518,12 +1386,9 @@ fn target_steps(target: Target, verbose: bool) -> Vec<Step> {
             &["-n", "dup"],
             sys,
         )],
-        Target::Uv => vec![Step::new(
-            "Upgrading uv tools...",
-            "uv",
-            &["tool", "upgrade", "--all"],
-            false,
-        )],
+        Target::Uv => {
+            vec![Step::new("Upgrading uv tools...", "uv", &["tool", "upgrade", "--all"], false)]
+        }
         Target::Winget => vec![Step::new(
             "Upgrading Windows packages with winget...",
             "winget",
@@ -1538,35 +1403,16 @@ fn target_steps(target: Target, verbose: bool) -> Vec<Step> {
             false,
         )],
         Target::Xbps => vec![
-            Step::new(
-                "Synchronizing xbps repositories...",
-                "xbps-install",
-                &["-S"],
-                sys,
-            ),
-            Step::new(
-                "Updating xbps itself...",
-                "xbps-install",
-                &["-yu", "xbps"],
-                sys,
-            ),
+            Step::new("Synchronizing xbps repositories...", "xbps-install", &["-S"], sys),
+            Step::new("Updating xbps itself...", "xbps-install", &["-yu", "xbps"], sys),
             Step::new("Updating xbps packages...", "xbps-install", &["-yu"], sys),
         ],
         Target::Yum => vec![
             Step::new("Updating yum packages...", "yum", &["-y", "update"], sys),
-            Step::new(
-                "Removing obsolete yum packages...",
-                "yum",
-                &["-y", "autoremove"],
-                sys,
-            ),
+            Step::new("Removing obsolete yum packages...", "yum", &["-y", "autoremove"], sys),
         ],
         Target::Zypper => {
-            let action = if read_os_release().0.contains("tumbleweed") {
-                "dup"
-            } else {
-                "update"
-            };
+            let action = zypper_action(&read_os_release().0);
             vec![
                 Step::new(
                     "Refreshing zypper repositories...",
@@ -1595,6 +1441,10 @@ fn target_steps(target: Target, verbose: bool) -> Vec<Step> {
     steps
 }
 
+fn zypper_action(os_id: &str) -> &'static str {
+    if os_id.contains("tumbleweed") { "dup" } else { "update" }
+}
+
 fn run_pip(
     settings: &Settings,
     dry_run: bool,
@@ -1602,7 +1452,7 @@ fn run_pip(
     log: Option<&Arc<Mutex<File>>>,
     progress: &ProgressBar,
 ) -> Status {
-    let interpreter = pip_interpreter_with(find_program, pip_installation_available);
+    let interpreter = pip_interpreter_with(&find_program, &pip_installation_available);
     let Some((program, executable)) = interpreter else {
         return Status::Unavailable("python or pip not found".to_owned());
     };
@@ -1616,27 +1466,18 @@ fn run_pip(
     let query_args = prefix
         .iter()
         .cloned()
-        .chain(
-            ["list", "--outdated", "--format=json"]
-                .into_iter()
-                .map(OsString::from),
-        )
+        .chain(["list", "--outdated", "--format=json"].into_iter().map(OsString::from))
         .collect::<Vec<_>>();
     let display = format_command(&program, &query_args);
     progress.set_message("Checking outdated Python packages...");
     if dry_run {
-        output.push(format!(
-            "Would inspect outdated Python packages with: {display}"
-        ));
+        output.push(format!("Would inspect outdated Python packages with: {display}"));
         let update = prefix
             .iter()
             .cloned()
             .chain(["install", "--upgrade", "<package>"].map(OsString::from))
             .collect::<Vec<_>>();
-        output.push(format!(
-            "For each outdated package: {}",
-            format_command(&program, &update)
-        ));
+        output.push(format!("For each outdated package: {}", format_command(&program, &update)));
         return Status::Ok;
     }
     let mut command = Command::new(&executable);
@@ -1646,9 +1487,9 @@ fn run_pip(
         Ok(value) => {
             let detail = output_text(&value);
             if let Some(log) = log
-                && let Err(error) = append_log(log, &format!("pip outdated check:\n{detail}"))
+                && let Err(error) = write_log(log, &format!("pip outdated check:\n{detail}"))
             {
-                return Status::Failed(format!("could not write log: {error}"));
+                return Status::Failed(error);
             }
             if detail.contains("No module named pip") {
                 return Status::Unavailable(
@@ -1658,11 +1499,7 @@ fn run_pip(
             return Status::Failed(if settings.silent || detail.trim().is_empty() {
                 format!("pip outdated check exited with {}", value.status)
             } else {
-                format!(
-                    "pip outdated check exited with {}: {}",
-                    value.status,
-                    detail.trim()
-                )
+                format!("pip outdated check exited with {}: {}", value.status, detail.trim())
             });
         }
         Err(error) => return Status::Failed(format!("could not run pip: {error}")),
@@ -1685,14 +1522,9 @@ fn run_pip(
             env: Vec::new(),
             system: false,
         };
-        progress.set_message(format!("Upgrading Python package {name}..."));
-        match execute_step(&step, false, settings, log, progress) {
-            Ok(text) => {
-                if !text.trim().is_empty() {
-                    output.push(text);
-                }
-            }
-            Err(error) => return Status::Failed(error),
+        progress.set_message(&format!("Upgrading Python package {name}..."));
+        if let Err(error) = execute_step(&step, false, settings, log, progress) {
+            return Status::Failed(error);
         }
     }
     Status::Ok
@@ -1724,22 +1556,17 @@ fn execute_step_attempt(
     }
     .ok_or_else(|| format!("{} not found or is not trusted", step.program))?;
     let mut command = if sudo_required {
-        let sudo =
-            find_trusted_sudo().ok_or_else(|| "no trusted sudo executable found".to_owned())?;
+        let sudo = find_trusted_sudo().ok_or_else(missing("no trusted sudo executable found"))?;
         let mut command = Command::new(sudo);
         command.args(["-n", "--"]);
         if step.env.is_empty() {
             command.arg(manager);
         } else {
-            let env = trusted_program("env")
-                .ok_or_else(|| "no trusted env executable found".to_owned())?;
+            let env =
+                trusted_program("env").ok_or_else(missing("no trusted env executable found"))?;
             command.arg(env);
             for (key, value) in &step.env {
-                command.arg(format!(
-                    "{}={}",
-                    key.to_string_lossy(),
-                    value.to_string_lossy()
-                ));
+                command.arg(format!("{}={}", key.to_string_lossy(), value.to_string_lossy()));
             }
             command.arg(manager);
         }
@@ -1759,11 +1586,8 @@ fn execute_step_attempt(
             parts.push("sudo".to_owned());
         }
         parts.push(step.program.clone());
-        let args: Vec<String> = step
-            .args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let args: Vec<String> =
+            step.args.iter().map(|arg| arg.to_string_lossy().into_owned()).collect();
         let vars: Vec<String> = step
             .env
             .iter()
@@ -1775,47 +1599,19 @@ fn execute_step_attempt(
             format_command_with_env(&parts, &vars, &args)
         ));
     }
+    let shown = format_command(&step.program, &step.args);
     if settings.verbose {
-        eprintln!(
-            "> {}",
-            format_command(
-                &step.program,
-                &step
-                    .args
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-            )
-        );
+        eprintln!("> {shown}");
     }
     if let Some(log) = log {
-        append_log(
-            log,
-            &format!(
-                "----- output: {} -----",
-                format_command(
-                    &step.program,
-                    &step
-                        .args
-                        .iter()
-                        .map(|arg| arg.to_string_lossy().into_owned())
-                        .collect::<Vec<_>>()
-                )
-            ),
-        )
-        .map_err(|error| format!("could not write log: {error}"))?;
+        write_log(log, &format!("----- output: {shown} -----"))?;
     }
     let filter_brew_download_progress = !settings.verbose
         && step.program == "brew"
         && step.args.first().is_some_and(|arg| arg == "update");
-    let (status, text) = stream_command(
-        command,
-        settings,
-        log,
-        progress,
-        filter_brew_download_progress,
-    )
-    .map_err(|error| format!("{}: {error}", step.description))?;
+    let (status, text) =
+        stream_command(command, settings, log, progress, filter_brew_download_progress)
+            .map_err(describe(&step.description))?;
     if status.success() {
         Ok(String::new())
     } else {
@@ -1825,8 +1621,7 @@ fn execute_step_attempt(
             (true, Some(102)) => {
                 let message = "zypper finished; a reboot is required to complete the update.";
                 if let Some(log) = log {
-                    append_log(log, message)
-                        .map_err(|error| format!("could not write log: {error}"))?;
+                    write_log(log, message)?;
                 }
                 if !settings.silent {
                     if progress.is_hidden() {
@@ -1839,8 +1634,7 @@ fn execute_step_attempt(
             }
             (true, Some(103)) if retry_zypper => {
                 if let Some(log) = log {
-                    append_log(log, "zypper updated itself; retrying the update.")
-                        .map_err(|error| format!("could not write log: {error}"))?;
+                    write_log(log, "zypper updated itself; retrying the update.")?;
                 }
                 execute_step_attempt(step, false, settings, log, progress, false)
             }
@@ -1850,10 +1644,7 @@ fn execute_step_attempt(
                 } else {
                     format!(": {}", text.trim())
                 };
-                Err(format!(
-                    "{} exited with {}{detail}",
-                    step.description, status
-                ))
+                Err(format!("{} exited with {}{detail}", step.description, status))
             }
         }
     }
@@ -1868,15 +1659,12 @@ fn stream_command(
 ) -> io::Result<(std::process::ExitStatus, String)> {
     use std::process::Stdio;
 
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let stdout = child.stdout.take().expect("piped stdout is available");
     let stderr = child.stderr.take().expect("piped stderr is available");
     let stdout_thread = spawn_output_reader(
-        stdout,
+        Box::new(stdout),
         false,
         settings.silent,
         log.cloned(),
@@ -1884,7 +1672,7 @@ fn stream_command(
         filter_brew_download_progress,
     );
     let stderr_thread = spawn_output_reader(
-        stderr,
+        Box::new(stderr),
         true,
         settings.silent,
         log.cloned(),
@@ -1892,12 +1680,8 @@ fn stream_command(
         filter_brew_download_progress,
     );
     let status = child.wait()?;
-    let stdout_text = stdout_thread
-        .join()
-        .map_err(|_| io::Error::other("stdout reader thread panicked"))??;
-    let stderr_text = stderr_thread
-        .join()
-        .map_err(|_| io::Error::other("stderr reader thread panicked"))??;
+    let stdout_text = join_reader(stdout_thread)?;
+    let stderr_text = join_reader(stderr_thread)?;
     let text = match (stdout_text.is_empty(), stderr_text.is_empty()) {
         (true, _) => stderr_text,
         (_, true) => stdout_text,
@@ -1906,17 +1690,18 @@ fn stream_command(
     Ok((status, text))
 }
 
-fn spawn_output_reader<R>(
-    reader: R,
+fn join_reader(handle: JoinHandle<io::Result<String>>) -> io::Result<String> {
+    handle.join().map_err(|_| io::Error::other("output reader thread panicked"))?
+}
+
+fn spawn_output_reader(
+    reader: Box<dyn Read + Send>,
     is_stderr: bool,
     silent: bool,
     log: SharedLog,
     progress: ProgressBar,
     filter_brew_download_progress: bool,
-) -> JoinHandle<io::Result<String>>
-where
-    R: Read + Send + 'static,
-{
+) -> JoinHandle<io::Result<String>> {
     std::thread::spawn(move || {
         let mut output = String::new();
         let mut chunk = [0_u8; 4096];
@@ -2010,21 +1795,16 @@ fn prepare_sudo_for_targets(
         "mnn: refreshing sudo credentials before starting progress..."
     };
     if reserve_top_line {
-        let mut stream = io::stdout().lock();
-        write_top_notice(&mut stream, notice)
-            .map_err(|error| format!("could not display sudo prompt: {error}"))?;
+        write_top_notice(&mut Console, notice)
+            .map_err(describe("could not display sudo prompt"))?;
     } else if settings.verbose {
         eprintln!("Refreshing sudo credentials...");
     } else {
         eprintln!("{notice}");
     }
-    io::stderr()
-        .flush()
-        .map_err(|error| format!("could not display sudo prompt: {error}"))?;
-    let status = Command::new(&sudo)
-        .arg("-v")
-        .status()
-        .map_err(|error| format!("could not start sudo: {error}"))?;
+    io::stderr().flush().map_err(describe("could not display sudo prompt"))?;
+    let status =
+        Command::new(&sudo).arg("-v").status().map_err(describe("could not start sudo"))?;
     if status.success() {
         Ok(Some(SudoKeepalive::start(sudo)))
     } else {
@@ -2051,8 +1831,12 @@ fn output_text(output: &Output) -> String {
     result
 }
 
+fn write_log(log: &Arc<Mutex<File>>, text: &str) -> Result<(), String> {
+    append_log(log, text).map_err(describe("could not write log"))
+}
+
 fn append_log(log: &Arc<Mutex<File>>, text: &str) -> io::Result<()> {
-    let mut file = log.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = lock(log);
     writeln!(file, "{text}")
 }
 
@@ -2092,26 +1876,37 @@ fn trusted_program_exists(name: &str) -> bool {
     trusted_program(name).is_some()
 }
 
+fn trusted_directories() -> Vec<PathBuf> {
+    #[cfg(test)]
+    if let Some(directories) = lock(&TRUSTED_OVERRIDE).clone() {
+        return directories;
+    }
+    ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+        .map(PathBuf::from)
+        .to_vec()
+}
+
+#[cfg(test)]
+static TRUSTED_OVERRIDE: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None);
+
+#[cfg(unix)]
+fn trusted_owner() -> u32 {
+    if cfg!(test) { effective_uid() } else { 0 }
+}
+
 fn trusted_program(name: &str) -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        for directory in [
-            "/usr/local/sbin",
-            "/usr/local/bin",
-            "/usr/sbin",
-            "/usr/bin",
-            "/sbin",
-            "/bin",
-        ] {
-            let candidate = Path::new(directory).join(name);
-            if trusted_path(&candidate) {
-                return Some(candidate);
-            }
-        }
+        trusted_directories()
+            .into_iter()
+            .map(|directory| directory.join(name))
+            .find(|candidate| trusted_path(candidate))
     }
     #[cfg(not(unix))]
-    let _ = name;
-    None
+    {
+        let _ = name;
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -2120,23 +1915,20 @@ fn trusted_path(path: &Path) -> bool {
     let Ok(resolved) = fs::canonicalize(path) else {
         return false;
     };
-    let Ok(metadata) = fs::symlink_metadata(&resolved) else {
-        return false;
-    };
-    let Ok(parent) = fs::metadata(resolved.parent().unwrap_or(Path::new("/"))) else {
-        return false;
-    };
-    metadata.is_file()
-        && metadata.uid() == 0
-        && metadata.mode() & 0o022 == 0
-        && parent.uid() == 0
-        && parent.mode() & 0o022 == 0
+    let parent = resolved.parent().unwrap_or(Path::new("/"));
+    fs::symlink_metadata(&resolved).ok().zip(fs::metadata(parent).ok()).is_some_and(
+        |(metadata, parent)| {
+            metadata.is_file()
+                && metadata.uid() == trusted_owner()
+                && metadata.mode() & 0o022 == 0
+                && parent.uid() == trusted_owner()
+                && parent.mode() & 0o022 == 0
+        },
+    )
 }
 
 fn find_trusted_sudo() -> Option<PathBuf> {
-    ["sudo", "sudo.exe"]
-        .iter()
-        .find_map(|name| trusted_program(name))
+    ["sudo", "sudo.exe"].iter().find_map(|name| trusted_program(name))
 }
 
 fn format_command(program: &str, args: &[impl AsRef<OsStr>]) -> String {
@@ -2158,10 +1950,7 @@ fn format_command_with_env(programs: &[String], env: &[String], args: &[String])
 
 fn quote_arg(arg: &OsStr) -> String {
     let text = arg.to_string_lossy();
-    if text
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_./:=@".contains(c))
-    {
+    if text.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@".contains(c)) {
         text.into_owned()
     } else {
         format!("'{}'", text.replace('\'', "'\\''"))
@@ -2173,7 +1962,7 @@ fn config_path() -> Result<PathBuf, String> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
         .or_else(|| home_dir().map(|home| home.join(".config")))
-        .ok_or_else(|| "cannot determine home or config directory".to_owned())?;
+        .ok_or_else(missing("cannot determine home or config directory"))?;
     ensure_absolute(&base, "config directory")?;
     Ok(base.join("mnn").join("config"))
 }
@@ -2183,32 +1972,20 @@ fn validate_user_file(path: &Path, label: &str) -> Result<(), String> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(format!(
-                "cannot inspect {label} {}: {error}",
-                path.display()
-            ));
+            return Err(format!("cannot inspect {label} {}: {error}", path.display()));
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "{label} path is not a regular file: {}",
-            path.display()
-        ));
+        return Err(format!("{label} path is not a regular file: {}", path.display()));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         if metadata.uid() != effective_uid() {
-            return Err(format!(
-                "{label} is not owned by the current user: {}",
-                path.display()
-            ));
+            return Err(format!("{label} is not owned by the current user: {}", path.display()));
         }
         if metadata.mode() & 0o022 != 0 {
-            return Err(format!(
-                "{label} is writable by group or others: {}",
-                path.display()
-            ));
+            return Err(format!("{label} is writable by group or others: {}", path.display()));
         }
     }
     Ok(())
@@ -2221,18 +1998,15 @@ fn ensure_user_directory(path: &Path, private: bool) -> Result<(), String> {
         Ok(_) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => {
-            return Err(format!(
-                "cannot inspect directory {}: {error}",
-                path.display()
-            ));
+            return Err(format!("cannot inspect directory {}: {error}", path.display()));
         }
     };
     if !existed {
         fs::create_dir_all(path)
-            .map_err(|error| format!("cannot create directory {}: {error}", path.display()))?;
+            .map_err(describe(format!("cannot create directory {}", path.display())))?;
     }
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect directory {}: {error}", path.display()))?;
+        .map_err(describe(format!("cannot inspect directory {}", path.display())))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(format!("unsafe directory path: {}", path.display()));
     }
@@ -2241,22 +2015,16 @@ fn ensure_user_directory(path: &Path, private: bool) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
         if metadata.uid() != effective_uid() {
-            return Err(format!(
-                "directory is not owned by the current user: {}",
-                path.display()
-            ));
+            return Err(format!("directory is not owned by the current user: {}", path.display()));
         }
         let mode = metadata.mode() & 0o777;
         if private && !existed {
             fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .map_err(|error| format!("cannot secure directory {}: {error}", path.display()))?;
+                .map_err(describe(format!("cannot secure directory {}", path.display())))?;
             return Ok(());
         }
         if mode & 0o022 != 0 || (private && mode & 0o077 != 0) {
-            return Err(format!(
-                "directory permissions are unsafe: {}",
-                path.display()
-            ));
+            return Err(format!("directory permissions are unsafe: {}", path.display()));
         }
     }
     Ok(())
@@ -2267,7 +2035,7 @@ fn data_dir() -> Result<PathBuf, String> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
         .or_else(|| home_dir().map(|home| home.join(".local").join("share")))
-        .ok_or_else(|| "cannot determine home or data directory".to_owned())?;
+        .ok_or_else(missing("cannot determine home or data directory"))?;
     ensure_absolute(&base, "data directory")?;
     Ok(base)
 }
@@ -2277,27 +2045,20 @@ fn state_dir() -> Result<PathBuf, String> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
         .or_else(|| home_dir().map(|home| home.join(".local").join("state")))
-        .ok_or_else(|| "cannot determine home or state directory".to_owned())?;
+        .ok_or_else(missing("cannot determine home or state directory"))?;
     ensure_absolute(&base, "state directory")?;
     Ok(base.join("mnn"))
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
 
 fn ensure_absolute(path: &Path, label: &str) -> Result<(), String> {
     if !path.is_absolute()
-        || path
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
+        || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
     {
-        Err(format!(
-            "{label} must be absolute and contain no '..': {}",
-            path.display()
-        ))
+        Err(format!("{label} must be absolute and contain no '..': {}", path.display()))
     } else {
         Ok(())
     }
@@ -2311,14 +2072,9 @@ fn open_log_file() -> Result<File, String> {
     #[cfg(unix)]
     if path.exists() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if fs::metadata(&path)
-            .map_err(|error| format!("cannot inspect log file: {error}"))?
-            .mode()
-            & 0o077
-            != 0
-        {
+        if fs::metadata(&path).map_err(describe("cannot inspect log file"))?.mode() & 0o077 != 0 {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                .map_err(|error| format!("cannot secure log file: {error}"))?;
+                .map_err(describe("cannot secure log file"))?;
         }
     }
     let mut options = OpenOptions::new();
@@ -2328,11 +2084,10 @@ fn open_log_file() -> Result<File, String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options
-        .open(&path)
-        .map_err(|error| format!("cannot open log {}: {error}", path.display()))?;
+    let mut file =
+        options.open(&path).map_err(describe(format!("cannot open log {}", path.display())))?;
     writeln!(file, "----- mnn run {} -----", unix_timestamp())
-        .map_err(|error| format!("cannot write log: {error}"))?;
+        .map_err(describe("cannot write log"))?;
     Ok(file)
 }
 
@@ -2350,17 +2105,13 @@ fn acquire_run_lock() -> Result<File, String> {
     }
     let file = options
         .open(&path)
-        .map_err(|error| format!("cannot open lock file {}: {error}", path.display()))?;
-    file.try_lock()
-        .map_err(|error| format!("another mnn run is active ({}): {error}", path.display()))?;
+        .map_err(describe(format!("cannot open lock file {}", path.display())))?;
+    file.try_lock().map_err(describe(format!("another mnn run is active ({})", path.display())))?;
     Ok(file)
 }
 
 fn unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 fn unix_day() -> u64 {
@@ -2372,9 +2123,7 @@ fn generate_config() -> Result<(), String> {
     if path.exists() {
         return Err(format!("config already exists: {}", path.display()));
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "config path has no parent directory".to_owned())?;
+    let parent = path.parent().ok_or_else(missing("config path has no parent directory"))?;
     ensure_user_directory(parent, false)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -2385,11 +2134,11 @@ fn generate_config() -> Result<(), String> {
     }
     let mut file = options
         .open(&path)
-        .map_err(|error| format!("cannot create config {}: {error}", path.display()))?;
+        .map_err(describe(format!("cannot create config {}", path.display())))?;
     file.write_all(
         b"targets=auto\nverbose=false\nsilent=false\nparallel=false\ndisable-log=false\n",
     )
-    .map_err(|error| format!("cannot write config {}: {error}", path.display()))?;
+    .map_err(describe(format!("cannot write config {}", path.display())))?;
     println!("Config generated: {}", path.display());
     Ok(())
 }
@@ -2439,9 +2188,8 @@ fn maintain(action: InstallAction, mode: Option<CompletionMode>) -> Result<(), S
                 println!("Binary installed: {}", binary.display());
             }
             install_completions(mode.unwrap_or(CompletionMode::Detect))?;
-            if !cfg!(windows) {
-                atomic_write_file(&man_install_path()?, MAN_PAGE.as_bytes())?;
-            }
+            #[cfg(not(windows))]
+            atomic_write_file(&man_install_path()?, MAN_PAGE.as_bytes())?;
             if matches!(action, InstallAction::Install) && !config_path()?.exists() {
                 generate_config()?;
             }
@@ -2457,17 +2205,15 @@ fn maintain(action: InstallAction, mode: Option<CompletionMode>) -> Result<(), S
             ] {
                 remove_file_if_present(&completion_path(shell)?)?;
             }
-            if !cfg!(windows) {
-                remove_file_if_present(&man_install_path()?)?;
-            }
+            #[cfg(not(windows))]
+            remove_file_if_present(&man_install_path()?)?;
             if matches!(action, InstallAction::Purge) {
                 remove_file_if_present(&config_path()?)?;
                 let logs = state_dir()?;
                 if fs::symlink_metadata(&logs).is_ok() {
                     ensure_user_directory(&logs, true)?;
-                    fs::remove_dir_all(&logs).map_err(|error| {
-                        format!("cannot remove logs {}: {error}", logs.display())
-                    })?;
+                    fs::remove_dir_all(&logs)
+                        .map_err(describe(format!("cannot remove logs {}", logs.display())))?;
                 }
             }
         }
@@ -2496,7 +2242,7 @@ fn action_matches(action: &InstallAction, destination: &Path, source: &Path) -> 
 }
 
 fn binary_install_path() -> Result<PathBuf, String> {
-    let home = home_dir().ok_or_else(|| "cannot determine home directory".to_owned())?;
+    let home = home_dir().ok_or_else(missing("cannot determine home directory"))?;
     let name = if cfg!(windows) { "mnn.exe" } else { "mnn" };
     Ok(home.join(".local").join("bin").join(name))
 }
@@ -2512,29 +2258,22 @@ fn source_binary() -> Result<PathBuf, String> {
         if candidate.is_file() {
             return Ok(candidate);
         }
-        return Err(format!(
-            "MNN_SOURCE_DIR binary not found: {}",
-            candidate.display()
-        ));
+        return Err(format!("MNN_SOURCE_DIR binary not found: {}", candidate.display()));
     }
-    std::env::current_exe().map_err(|error| format!("cannot resolve current executable: {error}"))
+    std::env::current_exe().map_err(describe("cannot resolve current executable"))
 }
 
 fn install_file(source: &Path, destination: &Path, preserve_existing: bool) -> Result<(), String> {
     validate_user_file(source, "binary source")?;
-    let parent = destination
-        .parent()
-        .ok_or_else(|| "install destination has no parent".to_owned())?;
+    let parent = destination.parent().ok_or_else(missing("install destination has no parent"))?;
     ensure_user_directory(parent, false)?;
     validate_user_file(destination, "install destination")?;
     if preserve_existing && destination.is_file() {
         return Ok(());
     }
-    let mut input =
-        File::open(source).map_err(|error| format!("cannot open binary source: {error}"))?;
+    let mut input = File::open(source).map_err(describe("cannot open binary source"))?;
     let (temporary, mut output) = create_temporary_file(destination)?;
-    io::copy(&mut input, &mut output)
-        .map_err(|error| format!("cannot copy executable: {error}"))?;
+    io::copy(&mut input, &mut output).map_err(describe("cannot copy executable"))?;
     set_executable_permissions(&output)?;
     drop(output);
     replace_file(&temporary, destination)
@@ -2542,27 +2281,21 @@ fn install_file(source: &Path, destination: &Path, preserve_existing: bool) -> R
 
 fn atomic_write_file(destination: &Path, contents: &[u8]) -> Result<(), String> {
     ensure_user_directory(
-        destination
-            .parent()
-            .ok_or_else(|| "output path has no parent directory".to_owned())?,
+        destination.parent().ok_or_else(missing("output path has no parent directory"))?,
         false,
     )?;
     validate_user_file(destination, "output file")?;
     let (temporary, mut output) = create_temporary_file(destination)?;
-    output
-        .write_all(contents)
-        .map_err(|error| format!("cannot write temporary file: {error}"))?;
+    output.write_all(contents).map_err(describe("cannot write temporary file"))?;
     drop(output);
     replace_file(&temporary, destination)
 }
 
 fn create_temporary_file(destination: &Path) -> Result<(PathBuf, File), String> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| "output path has no parent directory".to_owned())?;
+    let parent = destination.parent().ok_or_else(missing("output path has no parent directory"))?;
     let name = destination
         .file_name()
-        .ok_or_else(|| "output path has no file name".to_owned())?
+        .ok_or_else(missing("output path has no file name"))?
         .to_string_lossy();
     for attempt in 0..100 {
         let temporary = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), attempt));
@@ -2587,7 +2320,7 @@ fn set_executable_permissions(file: &File) -> Result<(), String> {
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("cannot set executable permissions: {error}"))?;
+            .map_err(describe("cannot set executable permissions"))?;
     }
     #[cfg(not(unix))]
     let _ = file;
@@ -2598,10 +2331,10 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), String> {
     #[cfg(windows)]
     if destination.exists() {
         fs::remove_file(destination)
-            .map_err(|error| format!("cannot replace {}: {error}", destination.display()))?;
+            .map_err(describe(format!("cannot replace {}", destination.display())))?;
     }
     fs::rename(temporary, destination)
-        .map_err(|error| format!("cannot install {}: {error}", destination.display()))
+        .map_err(describe(format!("cannot install {}", destination.display())))
 }
 
 fn remove_file_if_present(path: &Path) -> Result<(), String> {
@@ -2611,10 +2344,7 @@ fn remove_file_if_present(path: &Path) -> Result<(), String> {
         Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "refusing to remove unsafe path: {}",
-            path.display()
-        ));
+        return Err(format!("refusing to remove unsafe path: {}", path.display()));
     }
     #[cfg(unix)]
     {
@@ -2626,18 +2356,15 @@ fn remove_file_if_present(path: &Path) -> Result<(), String> {
             ));
         }
     }
-    fs::remove_file(path).map_err(|error| format!("cannot remove {}: {error}", path.display()))
+    fs::remove_file(path).map_err(describe(format!("cannot remove {}", path.display())))
 }
 
 fn completion_path(mode: CompletionMode) -> Result<PathBuf, String> {
-    let home = home_dir().ok_or_else(|| "cannot determine home directory".to_owned())?;
+    let home = home_dir().ok_or_else(missing("cannot determine home directory"))?;
     let data = data_dir()?;
     Ok(match mode {
         CompletionMode::Bash => data.join("bash-completion").join("completions").join("mnn"),
-        CompletionMode::Fish => data
-            .join("fish")
-            .join("vendor_completions.d")
-            .join("mnn.fish"),
+        CompletionMode::Fish => data.join("fish").join("vendor_completions.d").join("mnn.fish"),
         CompletionMode::Zsh => data.join("zsh").join("site-functions").join("_mnn"),
         CompletionMode::Nu => std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -2677,12 +2404,8 @@ fn install_completions(mode: CompletionMode) -> Result<(), String> {
         let path = completion_path(shell)?;
         let contents = completion_contents(shell);
         atomic_write_file(&path, &contents)
-            .map_err(|error| format!("cannot install completion {}: {error}", path.display()))?;
-        println!(
-            "{} completion installed: {}",
-            completion_name(shell),
-            path.display()
-        );
+            .map_err(describe(format!("cannot install completion {}", path.display())))?;
+        println!("{} completion installed: {}", completion_name(shell), path.display());
     }
     Ok(())
 }
@@ -2710,236 +2433,4 @@ fn completion_name(mode: CompletionMode) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-    use std::sync::{Condvar, mpsc};
-
-    #[test]
-    fn expands_aliases_and_deduplicates_targets_in_canonical_order() {
-        let selected = expand_targets(&[Target::Debian, Target::Apt, Target::Apt]);
-        assert_eq!(selected, vec![Target::Apt]);
-    }
-
-    #[test]
-    fn all_includes_windows_package_managers() {
-        let selected = expand_targets(&[Target::All]);
-        assert!(selected.contains(&Target::Pip));
-        assert!(selected.contains(&Target::Winget));
-        assert!(selected.contains(&Target::Choco));
-    }
-
-    #[test]
-    fn pip_target_requires_an_installed_pip_command_or_module() {
-        let find = |program: &OsStr| Some(PathBuf::from(program));
-        let interpreter = pip_interpreter_with(find, |program, _| program == "python3");
-        assert_eq!(
-            interpreter,
-            Some(("python3".to_owned(), PathBuf::from("python3")))
-        );
-
-        assert!(
-            pip_interpreter_with(find, |_, _| false).is_none(),
-            "an interpreter without pip must not be detected as a pip target"
-        );
-    }
-
-    #[test]
-    fn windows_targets_use_noninteractive_upgrade_commands() {
-        let winget = target_steps(Target::Winget, false);
-        assert_eq!(winget[0].program, "winget");
-        assert!(
-            winget[0]
-                .args
-                .iter()
-                .any(|arg| arg == "--accept-package-agreements")
-        );
-        let choco = target_steps(Target::Choco, false);
-        assert_eq!(choco[0].program, "choco");
-        assert_eq!(
-            choco[0].args,
-            ["upgrade", "all", "--yes", "--no-progress"].map(OsString::from)
-        );
-    }
-
-    #[test]
-    fn new_target_names_are_accepted_by_the_cli() {
-        assert!(Cli::try_parse_from(["mnn", "pip"]).is_ok());
-        assert!(Cli::try_parse_from(["mnn", "winget"]).is_ok());
-        assert!(Cli::try_parse_from(["mnn", "choco"]).is_ok());
-    }
-
-    #[test]
-    fn config_boolean_values_are_case_insensitive() {
-        assert!(parse_bool("parallel", "YES").unwrap());
-        assert!(!parse_bool("parallel", "No").unwrap());
-        assert!(parse_bool("parallel", "sometimes").is_err());
-    }
-
-    #[test]
-    fn command_arguments_are_quoted_without_shell_interpolation() {
-        assert_eq!(
-            format_command("manager", &["arg with spaces", "$(touch nope)"]),
-            "manager 'arg with spaces' '$(touch nope)'"
-        );
-    }
-
-    #[test]
-    fn completion_assets_are_available_for_every_legacy_shell() {
-        assert!(!completion_contents(CompletionMode::Bash).is_empty());
-        assert!(!completion_contents(CompletionMode::Fish).is_empty());
-        assert!(!completion_contents(CompletionMode::Zsh).is_empty());
-        assert!(completion_contents(CompletionMode::Nu).starts_with(b"def "));
-        assert!(MAN_PAGE.contains("winget"));
-    }
-
-    #[test]
-    fn output_reader_preserves_carriage_return_progress_updates() {
-        let progress = ProgressManager::new(false, true, 0, &[Target::Pip]);
-        let reader = spawn_output_reader(
-            Cursor::new(b"first\rsecond\r\nthird\n"),
-            false,
-            true,
-            None,
-            progress.bar(0),
-            false,
-        );
-        assert_eq!(reader.join().unwrap().unwrap(), "first\rsecond\r\nthird\n");
-    }
-
-    #[test]
-    fn brew_download_progress_filter_matches_only_numeric_counters() {
-        assert!(is_brew_download_progress_line(b"Downloading [6891]"));
-        assert!(!is_brew_download_progress_line(b"Downloading []"));
-        assert!(!is_brew_download_progress_line(b"Downloading [6891/10000]"));
-        assert!(!is_brew_download_progress_line(
-            b"Downloading Homebrew API data"
-        ));
-        assert!(!is_brew_download_progress_line(b"Nothing to update."));
-    }
-
-    #[test]
-    fn progress_frames_use_braille_patterns() {
-        assert!(
-            PROGRESS_FRAMES
-                .iter()
-                .all(|frame| ('\u{2800}'..='\u{28ff}').contains(frame))
-        );
-    }
-
-    #[test]
-    fn silent_progress_uses_footer_when_it_fits() {
-        assert!(use_progress_footer(true, 24, 8, 0));
-        assert!(use_progress_footer(true, 24, 1, 0));
-        assert!(!use_progress_footer(true, 11, 8, 0));
-        assert!(!use_progress_footer(false, 24, 8, 0));
-        assert!(use_progress_footer(true, 13, 8, 1));
-        assert!(!use_progress_footer(true, 12, 8, 1));
-    }
-
-    #[test]
-    fn silent_progress_rows_are_positioned_at_the_top() {
-        assert_eq!(progress_terminal_row(0, 8, 24, true, 0), 1);
-        assert_eq!(progress_terminal_row(7, 8, 24, true, 0), 8);
-        assert_eq!(progress_terminal_row(0, 8, 24, false, 0), 17);
-        assert_eq!(progress_terminal_row(7, 8, 24, false, 0), 24);
-        assert_eq!(progress_terminal_row(0, 8, 24, true, 1), 2);
-        assert_eq!(progress_terminal_row(7, 8, 24, true, 1), 9);
-        assert_eq!(top_progress_next_row(8, 1, true), 10);
-        assert_eq!(top_progress_next_row(1, 1, false), 3);
-    }
-
-    #[test]
-    fn sudo_notice_is_written_on_the_line_above_progress() {
-        let mut output = Vec::new();
-        write_top_notice(&mut output, "mnn: refreshing sudo credentials...").unwrap();
-        assert_eq!(
-            output,
-            b"\x1b[1;1H\x1b[2Kmnn: refreshing sudo credentials...\r\n"
-        );
-        assert_eq!(progress_terminal_row(0, 8, 24, true, 1), 2);
-    }
-
-    #[test]
-    fn silent_progress_does_not_repeat_completed_rows_after_footer() {
-        assert!(!ProgressManager::new(false, true, 0, &[Target::Pip]).print_completed_rows);
-        assert!(ProgressManager::new(false, false, 0, &[Target::Pip]).print_completed_rows);
-    }
-
-    #[test]
-    fn parallel_targets_start_before_any_worker_finishes() {
-        let (started_tx, started_rx) = mpsc::channel();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let worker_gate = Arc::clone(&gate);
-        let worker = std::thread::spawn(move || {
-            execute_targets(&[Target::Brew, Target::Pip], true, |_, target| {
-                started_tx.send(target).unwrap();
-                let (released, ready) = &*worker_gate;
-                let mut released = released.lock().unwrap();
-                while !*released {
-                    released = ready.wait(released).unwrap();
-                }
-                TargetResult {
-                    target,
-                    status: Status::Ok,
-                    output: Vec::new(),
-                }
-            })
-        });
-
-        let first_started = started_rx.recv_timeout(Duration::from_secs(2)).is_ok();
-        let second_started = started_rx.recv_timeout(Duration::from_secs(2)).is_ok();
-        let (released, ready) = &*gate;
-        *released.lock().unwrap() = true;
-        ready.notify_all();
-        let results = worker.join().unwrap();
-
-        assert!(first_started && second_started);
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].target, Target::Brew);
-        assert_eq!(results[1].target, Target::Pip);
-    }
-
-    #[test]
-    fn progress_status_symbols_keep_their_colors() {
-        for (status, symbol, label, color) in [
-            (Status::Ok, '✓', "OK", "32"),
-            (
-                Status::Unavailable("not installed".to_owned()),
-                '○',
-                "UNAVAILABLE",
-                "36",
-            ),
-            (
-                Status::Skipped("not selected".to_owned()),
-                '⊘',
-                "SKIP",
-                "34",
-            ),
-            (
-                Status::Failed("command failed".to_owned()),
-                '✗',
-                "ERR",
-                "31",
-            ),
-        ] {
-            let progress = ProgressManager::new(false, false, 0, &[Target::Pip]);
-            progress.bar(0).finish(Target::Pip, &status);
-            let rows = progress
-                .inner
-                .rows
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let row = &rows[0];
-            assert_eq!(row.symbol, symbol);
-            assert_eq!(row.status, label);
-            let line = format_progress_line(1, 1, row, 80, true);
-            assert!(line.contains(&format!("\x1b[{color}m{symbol}\x1b[0m")));
-            assert!(line.contains(&format!("\x1b[{color}m{label}\x1b[0m")));
-            assert_eq!(
-                format_progress_line(1, 1, row, 80, false).chars().count(),
-                80
-            );
-        }
-    }
-}
+mod tests;
