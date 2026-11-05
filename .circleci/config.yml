@@ -91,10 +91,13 @@ jobs:
     docker:
       - image: cimg/python:3.12
     steps:
-      - checkout
       - setup-trufflehog
-      - run: if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch --unshallow; fi
-      - run: trufflehog git "file://$PWD" --results=verified --fail --no-update
+      # CircleCI checks out a blobless clone, so trufflehog scans a full clone instead
+      - run:
+          name: Scan history
+          command: |
+            git clone --quiet "$CIRCLE_REPOSITORY_URL" "$HOME/scan"
+            trufflehog git "file://$HOME/scan" --results=verified --fail --no-update
 
   commitlint:
     executor: rust
